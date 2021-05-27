@@ -1,5 +1,6 @@
 # PURE_ace05zh
 [中文](README_zh.md)|[English](README.md)
+
 [PURE](https://github.com/princeton-nlp/PURE)模型命名实体识别的中文ace2005修改版，移除掉了allennlp包依赖，添加了中文ace2005的数据处理代码，代码基于[ace2005chinese_preprocess](https://github.com/ll0iecas/ace2005chinese_preprocess)，做了些许改动让解析后的数据符合`PURE`模型
 
 1. 运行`ace_parser.py`
