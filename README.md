@@ -1,7 +1,7 @@
 # PURE_ace05zh
 [中文](README_zh.md)|[English](README.md)
 
-pure name entity recognition model for ace2005 Chinese
+PURE name entity recognition model for ace2005 Chinese
 
 a name entity recognition model base on [PURE](https://github.com/princeton-nlp/PURE) for Chinese ace2005 dataset. Comparing with origin PURE, I just removed allennlp package dependence.
 
