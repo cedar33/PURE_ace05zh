@@ -1,0 +1,206 @@
+import torch
+from typing import Optional, Union, List
+
+def get_range_vector(size: int, device: int) -> torch.Tensor:
+    """
+    Returns a range vector with the desired size, starting at 0. The CUDA implementation
+    is meant to avoid copy data from CPU to GPU.
+    """
+    if device > -1:
+        return torch.cuda.LongTensor(size, device=device).fill_(1).cumsum(0) - 1
+    else:
+        return torch.arange(0, size, dtype=torch.long)
+
+def get_device_of(tensor: torch.Tensor) -> int:
+    """
+    Returns the device of the tensor.
+    """
+    if not tensor.is_cuda:
+        return -1
+    else:
+        return tensor.get_device()
+
+def flatten_and_batch_shift_indices(indices: torch.Tensor, sequence_length: int) -> torch.Tensor:
+    """
+    This is a subroutine for [`batched_index_select`](./util.md#batched_index_select).
+    The given `indices` of size `(batch_size, d_1, ..., d_n)` indexes into dimension 2 of a
+    target tensor, which has size `(batch_size, sequence_length, embedding_size)`. This
+    function returns a vector that correctly indexes into the flattened target. The sequence
+    length of the target must be provided to compute the appropriate offsets.
+    ```python
+        indices = torch.ones([2,3], dtype=torch.long)
+        # Sequence length of the target tensor.
+        sequence_length = 10
+        shifted_indices = flatten_and_batch_shift_indices(indices, sequence_length)
+        # Indices into the second element in the batch are correctly shifted
+        # to take into account that the target tensor will be flattened before
+        # the indices are applied.
+        assert shifted_indices == [1, 1, 1, 11, 11, 11]
+    ```
+    # Parameters
+    indices : `torch.LongTensor`, required.
+    sequence_length : `int`, required.
+        The length of the sequence the indices index into.
+        This must be the second dimension of the tensor.
+    # Returns
+    offset_indices : `torch.LongTensor`
+    """
+    # Shape: (batch_size)
+    if torch.max(indices) >= sequence_length or torch.min(indices) < 0:
+        raise ValueError(
+            f"All elements in indices should be in range (0, {sequence_length - 1})"
+        )
+    offsets = get_range_vector(indices.size(0), get_device_of(indices)) * sequence_length
+    for _ in range(len(indices.size()) - 1):
+        offsets = offsets.unsqueeze(1)
+
+    # Shape: (batch_size, d_1, ..., d_n)
+    offset_indices = indices + offsets
+
+    # Shape: (batch_size * d_1 * ... * d_n)
+    offset_indices = offset_indices.view(-1)
+    return offset_indices
+
+def batched_index_select(
+    target: torch.Tensor,
+    indices: torch.LongTensor,
+    flattened_indices: Optional[torch.LongTensor] = None,
+) -> torch.Tensor:
+    """
+    The given `indices` of size `(batch_size, d_1, ..., d_n)` indexes into the sequence
+    dimension (dimension 2) of the target, which has size `(batch_size, sequence_length,
+    embedding_size)`.
+    This function returns selected values in the target with respect to the provided indices, which
+    have size `(batch_size, d_1, ..., d_n, embedding_size)`. This can use the optionally
+    precomputed `flattened_indices` with size `(batch_size * d_1 * ... * d_n)` if given.
+    An example use case of this function is looking up the start and end indices of spans in a
+    sequence tensor. This is used in the
+    [CoreferenceResolver](https://docs.allennlp.org/models/main/models/coref/models/coref/)
+    model to select contextual word representations corresponding to the start and end indices of
+    mentions.
+    The key reason this can't be done with basic torch functions is that we want to be able to use look-up
+    tensors with an arbitrary number of dimensions (for example, in the coref model, we don't know
+    a-priori how many spans we are looking up).
+    # Parameters
+    target : `torch.Tensor`, required.
+        A 3 dimensional tensor of shape (batch_size, sequence_length, embedding_size).
+        This is the tensor to be indexed.
+    indices : `torch.LongTensor`
+        A tensor of shape (batch_size, ...), where each element is an index into the
+        `sequence_length` dimension of the `target` tensor.
+    flattened_indices : `Optional[torch.Tensor]`, optional (default = `None`)
+        An optional tensor representing the result of calling `flatten_and_batch_shift_indices`
+        on `indices`. This is helpful in the case that the indices can be flattened once and
+        cached for many batch lookups.
+    # Returns
+    selected_targets : `torch.Tensor`
+        A tensor with shape [indices.size(), target.size(-1)] representing the embedded indices
+        extracted from the batch flattened target tensor.
+    """
+    if flattened_indices is None:
+        # Shape: (batch_size * d_1 * ... * d_n)
+        flattened_indices = flatten_and_batch_shift_indices(indices, target.size(1))
+
+    # Shape: (batch_size * sequence_length, embedding_size)
+    flattened_target = target.view(-1, target.size(-1))
+
+    # Shape: (batch_size * d_1 * ... * d_n, embedding_size)
+    flattened_selected = flattened_target.index_select(0, flattened_indices)
+    selected_shape = list(indices.size()) + [target.size(-1)]
+    # Shape: (batch_size, d_1, ..., d_n, embedding_size)
+    selected_targets = flattened_selected.view(*selected_shape)
+    return selected_targets
+
+class FeedForward(torch.nn.Module):
+    """
+    This `Module` is a feed-forward neural network, just a sequence of `Linear` layers with
+    activation functions in between.
+    # Parameters
+    input_dim : `int`, required
+        The dimensionality of the input.  We assume the input has shape `(batch_size, input_dim)`.
+    num_layers : `int`, required
+        The number of `Linear` layers to apply to the input.
+    hidden_dims : `Union[int, List[int]]`, required
+        The output dimension of each of the `Linear` layers.  If this is a single `int`, we use
+        it for all `Linear` layers.  If it is a `List[int]`, `len(hidden_dims)` must be
+        `num_layers`.
+    activations : `Union[Activation, List[Activation]]`, required
+        The activation function to use after each `Linear` layer.  If this is a single function,
+        we use it after all `Linear` layers.  If it is a `List[Activation]`,
+        `len(activations)` must be `num_layers`. Activation must have torch.nn.Module type.
+    dropout : `Union[float, List[float]]`, optional (default = `0.0`)
+        If given, we will apply this amount of dropout after each layer.  Semantics of `float`
+        versus `List[float]` is the same as with other parameters.
+    # Examples
+    ```python
+    FeedForward(124, 2, [64, 32], torch.nn.ReLU(), 0.2)
+    #> FeedForward(
+    #>   (_activations): ModuleList(
+    #>     (0): ReLU()
+    #>     (1): ReLU()
+    #>   )
+    #>   (_linear_layers): ModuleList(
+    #>     (0): Linear(in_features=124, out_features=64, bias=True)
+    #>     (1): Linear(in_features=64, out_features=32, bias=True)
+    #>   )
+    #>   (_dropout): ModuleList(
+    #>     (0): Dropout(p=0.2, inplace=False)
+    #>     (1): Dropout(p=0.2, inplace=False)
+    #>   )
+    #> )
+    ```
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        num_layers: int,
+        hidden_dims: Union[int, List[int]],
+        activations: None,
+        dropout: Union[float, List[float]] = 0.0,
+    ) -> None:
+
+        super().__init__()
+        if not isinstance(hidden_dims, list):
+            hidden_dims = [hidden_dims] * num_layers  # type: ignore
+        if not isinstance(activations, list):
+            activations = [activations] * num_layers  # type: ignore
+        if not isinstance(dropout, list):
+            dropout = [dropout] * num_layers  # type: ignore
+        if len(hidden_dims) != num_layers:
+            raise ValueError(
+                "len(hidden_dims) (%d) != num_layers (%d)" % (len(hidden_dims), num_layers)
+            )
+        if len(activations) != num_layers:
+            raise ValueError(
+                "len(activations) (%d) != num_layers (%d)" % (len(activations), num_layers)
+            )
+        if len(dropout) != num_layers:
+            raise ValueError(
+                "len(dropout) (%d) != num_layers (%d)" % (len(dropout), num_layers)
+            )
+        self._activations = torch.nn.ModuleList(activations)
+        input_dims = [input_dim] + hidden_dims[:-1]
+        linear_layers = []
+        for layer_input_dim, layer_output_dim in zip(input_dims, hidden_dims):
+            linear_layers.append(torch.nn.Linear(layer_input_dim, layer_output_dim))
+        self._linear_layers = torch.nn.ModuleList(linear_layers)
+        dropout_layers = [torch.nn.Dropout(p=value) for value in dropout]
+        self._dropout = torch.nn.ModuleList(dropout_layers)
+        self._output_dim = hidden_dims[-1]
+        self.input_dim = input_dim
+
+    def get_output_dim(self):
+        return self._output_dim
+
+    def get_input_dim(self):
+        return self.input_dim
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+
+        output = inputs
+        for layer, activation, dropout in zip(
+            self._linear_layers, self._activations, self._dropout
+        ):
+            output = dropout(activation(layer(output)))
+        return output
