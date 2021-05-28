@@ -9,6 +9,7 @@ import torch
 from transformers import AdamW, get_linear_schedule_with_warmup
 from tqdm import tqdm
 import json
+import numpy as np
 
 from models import EntityModel
 from util import batchify, convert_dataset_to_samples
@@ -24,6 +25,17 @@ def save_model(model, args):
     model_to_save = model.bert_model.module if hasattr(model.bert_model, 'module') else model.bert_model
     model_to_save.save_pretrained(args.output_dir)
     model.tokenizer.save_pretrained(args.output_dir)
+
+class NpEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        else:
+            return super(NpEncoder, self).default(obj)
 
 def output_ner_predictions(model, batches, dataset, output_file):
     """
@@ -66,7 +78,7 @@ def output_ner_predictions(model, batches, dataset, output_file):
 
     logger.info('Output predictions to %s..'%(output_file))
     with open(output_file, 'w') as f:
-        f.write('\n'.join(json.dumps(doc, cls=NpEncoder) for doc in js))
+        f.write('\n'.join(json.dumps(doc, cls=NpEncoder, ensure_ascii=False) for doc in js))
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
                     datefmt='%m/%d/%Y %H:%M:%S',
